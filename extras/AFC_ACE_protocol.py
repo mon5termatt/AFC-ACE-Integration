@@ -413,9 +413,11 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        result = self.send_command("dryer_start", {
+        # ACEPRO reference implementation uses method "drying" with params
+        # {temp: <c>, duration: <minutes>}
+        result = self.send_command("drying", {
             "temp": temp,
-            "time": duration
+            "duration": duration
         })
         return result is not None
 
@@ -426,5 +428,6 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        result = self.send_command("dryer_stop")
+        # ACEPRO reference implementation uses method "drying_stop"
+        result = self.send_command("drying_stop")
         return result is not None
