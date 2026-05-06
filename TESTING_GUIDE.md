@@ -15,7 +15,7 @@ Quick reference for testing the AFC-ACE integration.
 ```bash
 # From your Klipper host (SSH into your Pi)
 cd ~/
-git clone <your-repo>/AFC-ACE-Integration.git
+git clone https://github.com/mon5termatt/AFC-ACE-Integration.git
 cd AFC-ACE-Integration
 ./install-afc-ace.sh
 ```

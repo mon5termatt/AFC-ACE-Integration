@@ -35,7 +35,7 @@ Clone and install the AFC-ACE integration:
 
 ```bash
 cd ~/
-git clone <your-repo>/AFC-ACE-Integration.git
+git clone https://github.com/mon5termatt/AFC-ACE-Integration.git
 cd AFC-ACE-Integration
 ./install-afc-ace.sh
 ```
@@ -237,12 +237,11 @@ This displays:
 
 ## Next Steps
 
-- **[CONFIGURATION.md](./CONFIGURATION.md)** - Detailed configuration reference
 - **[USAGE.md](./USAGE.md)** - Operating your AFC-ACE system
 - **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** - Common issues and solutions
 
 ## Getting Help
 
 - **AFC Documentation**: https://armoredturtle.xyz/docs/
-- **GitHub Issues**: <your-repo-url>/issues
+- **GitHub Issues**: https://github.com/mon5termatt/AFC-ACE-Integration/issues
 - **AFC Discord**: https://discord.gg/eT8zc3bvPR

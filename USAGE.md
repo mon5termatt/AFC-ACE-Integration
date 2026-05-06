@@ -329,6 +329,5 @@ AFC integrates with Spoolman for filament tracking:
 
 ## Next Steps
 
-- **[CONFIGURATION.md](./CONFIGURATION.md)** - Advanced configuration options
 - **[TROUBLESHOOTING.md](./TROUBLESHOOTING.md)** - Detailed troubleshooting guide
 - **[AFC Documentation](https://armoredturtle.xyz/docs/)** - Complete AFC reference

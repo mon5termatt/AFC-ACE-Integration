@@ -428,7 +428,7 @@ tail -100 ~/printer_data/logs/klippy.log
 ### Support Channels
 
 - **AFC Discord:** https://discord.gg/eT8zc3bvPR
-- **GitHub Issues:** <your-repo>/issues
+- **GitHub Issues:** https://github.com/mon5termatt/AFC-ACE-Integration/issues
 - **AFC Docs:** https://armoredturtle.xyz/docs/
 
 ---

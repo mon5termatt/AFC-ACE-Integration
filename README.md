@@ -5,8 +5,8 @@
 **Native ACE Pro Support for AFC Multi-Material System**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)]()
-[![Klipper](https://img.shields.io/badge/Klipper-Compatible-blue)]()
+[![Status: Beta](https://img.shields.io/badge/Status-Beta-orange)](https://github.com/mon5termatt/AFC-ACE-Integration)
+[![Klipper](https://img.shields.io/badge/Klipper-Compatible-blue)](https://www.klipper3d.org/)
 
 </div>
 
@@ -78,19 +78,18 @@ cd AFC-Klipper-Add-On
 
 # 2. Install AFC-ACE
 cd ~/
-git clone <your-repo>/AFC-ACE-Integration.git
+git clone https://github.com/mon5termatt/AFC-ACE-Integration.git
 cd AFC-ACE-Integration
 ./install-afc-ace.sh
 
 # 3. Generate config
 python3 utilities/detect_ace_devices.py --generate-config > ~/printer_data/config/AFC/AFC_ACE_Pro.cfg
 
-# 4. Add to printer.cfg (AFC_ACE_Pro.cfg is auto-loaded)
-echo "[include AFC/*.cfg]" >> ~/printer_data/config/printer.cfg
-
-# 5. Restart Klipper
+# 4. Restart Klipper
 sudo systemctl restart klipper
 ```
+
+> Note: `install-afc-ace.sh` ensures `[include AFC/*.cfg]` is present in `printer.cfg` **above** Klipper’s `SAVE_CONFIG` auto-generated block (and avoids duplicates), so you generally do not need to manually `echo` it in.
 
 ### First Use
 
@@ -129,12 +128,11 @@ AFC-ACE-Integration/
 │
 ├── install-afc-ace.sh               # Installation script
 │
-└── docs/                            # Documentation
-    ├── README.md                   # This file
-    ├── INSTALLATION.md             # Install guide
-    ├── USAGE.md                    # User manual
-    ├── TESTING_GUIDE.md            # Test procedures
-    └── PROJECT_SUMMARY.md          # Technical details
+├── README.md                        # Overview and quick start
+├── INSTALLATION.md                  # Install guide
+├── USAGE.md                         # User manual
+├── TESTING_GUIDE.md                 # Test procedures
+└── PROJECT_SUMMARY.md               # Technical details
 ```
 
 ## Requirements
@@ -223,11 +221,20 @@ ACE_GET_STATUS                          # Show device status
 ACE_FEED INDEX=0 LENGTH=50 SPEED=50    # Feed 50mm
 ACE_RETRACT INDEX=0 LENGTH=50 SPEED=50 # Retract 50mm
 
+# Feed assist
+ACE_ENABLE_FEED_ASSIST LANE=0          # Enable feed assist for a slot
+ACE_DISABLE_FEED_ASSIST LANE=0         # Disable feed assist for a slot
+
 # Endless spool
 AFC_ENDLESS_SPOOL ENABLE=1              # Enable auto-switching
 
 # Gate mapping
 ACE_GATE_MAP GATE=0 TYPE=PLA COLOR=FF0000 TEMP=210
+
+# RFID (untested)
+ACE_ENABLE_RFID                         # Enable RFID reader
+ACE_GET_FILAMENT_INFO INDEX=0           # Query RFID filament info for slot 0 (repeat 0-3)
+ACE_DISABLE_RFID                        # Disable RFID reader
 ```
 
 ## Contributing
@@ -243,7 +250,7 @@ Contributions welcome! Please:
 ### Development Setup
 
 ```bash
-git clone <your-fork>/AFC-ACE-Integration.git
+git clone https://github.com/mon5termatt/AFC-ACE-Integration.git
 cd AFC-ACE-Integration
 
 # Make changes
@@ -294,7 +301,7 @@ All adapted code is clearly attributed and compatible with MIT licensing.
 
 <div align="center">
 
-**[Documentation](./INSTALLATION.md)** • **[Issues](https://github.com/your-repo/issues)** • **[Discord](https://discord.gg/eT8zc3bvPR)**
+**[Documentation](./INSTALLATION.md)** • **[Issues](https://github.com/mon5termatt/AFC-ACE-Integration/issues)** • **[Discord](https://discord.gg/eT8zc3bvPR)**
 
 Made with ❤️ for the AFC community
 
