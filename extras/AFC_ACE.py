@@ -241,6 +241,19 @@ class afcACE(afcUnit):
             desc="Disable ACE feed assist for a slot (UNIT=<name> LANE=0-3)"
         )
 
+        self.gcode.register_mux_command(
+            "ACE_ENABLE_RFID", "UNIT", self.name, self.cmd_ACE_ENABLE_RFID,
+            desc="Enable ACE RFID reader (UNIT=<name>)"
+        )
+        self.gcode.register_mux_command(
+            "ACE_DISABLE_RFID", "UNIT", self.name, self.cmd_ACE_DISABLE_RFID,
+            desc="Disable ACE RFID reader (UNIT=<name>)"
+        )
+        self.gcode.register_mux_command(
+            "ACE_GET_FILAMENT_INFO", "UNIT", self.name, self.cmd_ACE_GET_FILAMENT_INFO,
+            desc="Query RFID filament info for a slot (UNIT=<name> INDEX=0-3)"
+        )
+
         # Note: Do not also register non-mux commands with the same names.
         # Klipper treats the mux base command as the command name, so registering
         # both would halt with "gcode command ... already registered".
@@ -386,6 +399,47 @@ class afcACE(afcUnit):
         if not ok:
             raise error(f"AFC_ACE: ACE_DISABLE_FEED_ASSIST failed (unit={self.name} lane={lane})")
         self.afc.gcode.respond_info(f"ACE_DISABLE_FEED_ASSIST: unit={self.name} lane={lane}")
+
+    def cmd_ACE_ENABLE_RFID(self, gcmd):
+        return self._cmd_guard("ACE_ENABLE_RFID", lambda: self._cmd_ACE_ENABLE_RFID(gcmd))
+
+    def _cmd_ACE_ENABLE_RFID(self, gcmd):
+        self._ensure_connected()
+        ok = self.protocol.enable_rfid()
+        if not ok:
+            raise error(f"AFC_ACE: ACE_ENABLE_RFID failed (unit={self.name})")
+        self.afc.gcode.respond_info(f"ACE_ENABLE_RFID: unit={self.name}")
+
+    def cmd_ACE_DISABLE_RFID(self, gcmd):
+        return self._cmd_guard("ACE_DISABLE_RFID", lambda: self._cmd_ACE_DISABLE_RFID(gcmd))
+
+    def _cmd_ACE_DISABLE_RFID(self, gcmd):
+        self._ensure_connected()
+        ok = self.protocol.disable_rfid()
+        if not ok:
+            raise error(f"AFC_ACE: ACE_DISABLE_RFID failed (unit={self.name})")
+        self.afc.gcode.respond_info(f"ACE_DISABLE_RFID: unit={self.name}")
+
+    def cmd_ACE_GET_FILAMENT_INFO(self, gcmd):
+        return self._cmd_guard("ACE_GET_FILAMENT_INFO", lambda: self._cmd_ACE_GET_FILAMENT_INFO(gcmd))
+
+    def _cmd_ACE_GET_FILAMENT_INFO(self, gcmd):
+        self._ensure_connected()
+        index = gcmd.get_int("INDEX", None)
+        if index is None:
+            index = gcmd.get_int("LANE", None)
+        if index is None:
+            raise error("AFC_ACE: Missing INDEX (or LANE) parameter")
+        if index < 0 or index > 3:
+            raise error("AFC_ACE: INDEX must be 0-3 for an ACE unit")
+
+        info = self.protocol.get_filament_info(index)
+        if not info:
+            self.afc.gcode.respond_info(f"ACE_GET_FILAMENT_INFO: No response (unit={self.name} index={index})")
+            return
+        # Print as JSON so it can be copy/pasted easily.
+        import json
+        self.afc.gcode.respond_info(f"ACE_GET_FILAMENT_INFO: {json.dumps(info, sort_keys=True)}")
 
     def _build_lane_mapping(self):
         """Build mapping between AFC lanes and ACE slots"""
