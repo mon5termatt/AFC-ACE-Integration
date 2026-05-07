@@ -75,7 +75,34 @@ cd ~/
 git clone https://github.com/ArmoredTurtle/AFC-Klipper-Add-On.git
 cd AFC-Klipper-Add-On
 ./install-afc.sh
+```
 
+**`install-afc.sh` — bootstrap only**
+
+Running `install-afc.sh` mainly installs the AFC Klipper extras and drops starter files under `~/printer_data/config/AFC/`. The menu choices below only control **what that script writes for a BoxTurtle-shaped install**.
+
+**After you run `utilities/detect_ace_devices.py --generate-config` and save the output as `AFC_ACE_Pro.cfg`, none of that BoxTurtle-specific menu detail is what defines your system anymore** — your real unit and lanes come from the generated `[AFC_ACE …]` and `[AFC_lane …]` sections. You must **remove** the Turtle unit file(s) the installer created (see step 3 below), or Klipper will still load duplicate/wrong lane definitions via `[include AFC/*.cfg]`.
+
+If you are doing a **pure ACE** setup (no BoxTurtle hardware), the interactive choices are largely irrelevant beyond getting a minimal AFC tree; you still need to **delete** the Turtle artifacts after generating ACE config.
+
+---
+
+**Typical menu picks when the installer was run as “BoxTurtle (4-lane), no buffer” (only affects files until you replace them with ACE config)**
+
+The installer menu is interactive. Set at least the following before choosing **I** (install):
+
+| Key | Setting | What to choose |
+|-----|---------|----------------|
+| **T** | Installation type | **BoxTurtle (4-Lane)** (this is the default; change only if you use 8-lane or another unit) |
+| **9** | Toolhead sensor vs ramming | **Sensor** — uses a filament switch at the extruder. Do **not** use *Ramming* unless you are using a TurtleNeck buffer for ram-based detection. |
+| **A** | Toolhead sensor pin | Your real Klipper pin for the **filament presence sensor at the toolhead** (the switch that sees filament in the extruder). Examples: `^!PB3`, `toolhead:gpio6`, or a board alias like `nhk:gpio13` — use the same naming style as the rest of your `printer.cfg`. You must set this; leaving it **Unknown** will not configure the pin. |
+| **B** | Buffer type | **None** — cycle with **B** until it shows `None` (defaults are often `TurtleNeck` → `TurtleNeckV2` → `None`). ACE feeds straight to the extruder; you do not need a BoxTurtle buffer section for basic ACE operation. |
+| **C** | BoxTurtle name | Optional: default **Turtle_1** is fine unless you rename the unit in config. |
+| **I** | Install | Writes `~/printer_data/config/AFC/`, links Klipper extras, and can add `[include AFC/*.cfg]` to `printer.cfg` when “Add AFC includes?” is enabled. |
+
+After install, you would normally finish BoxTurtle MCU serial/CAN in `~/printer_data/config/AFC/AFC_<name>.cfg` — **for ACE-only, skip that and remove that file after step 3 instead.**
+
+```bash
 # 2. Install AFC-ACE
 cd ~/
 git clone https://github.com/mon5termatt/AFC-ACE-Integration.git
@@ -84,7 +111,23 @@ cd AFC-ACE-Integration
 
 # 3. Generate config
 python3 utilities/detect_ace_devices.py --generate-config > ~/printer_data/config/AFC/AFC_ACE_Pro.cfg
+```
 
+**Remove Turtle / BoxTurtle config files (required for ACE-only)**
+
+`[include AFC/*.cfg]` loads every `.cfg` in that folder. The installer copies a **BoxTurtle unit** file such as:
+
+- `~/printer_data/config/AFC/AFC_Turtle_1.cfg` (default name), or `AFC_<BoxTurtle_name>.cfg` if you changed it in the installer.
+
+**Delete that file** (or move it outside `AFC/`) so only ACE lanes from `AFC_ACE_Pro.cfg` remain. Otherwise you keep stale `[AFC_BoxTurtle …]` / lane sections that conflict with `[AFC_ACE …]`.
+
+If you **do not** have a BoxTurtle AFC board, also remove the unused MCU snippet and includes, for example:
+
+- `~/printer_data/config/AFC/mcu/AFC_Lite.cfg` (4-lane install) or `mcu/AFC_Pro.cfg` (8-lane), and any `[include mcu/…]` lines in `AFC_Hardware.cfg` that reference them.
+
+Keep `AFC.cfg` and the parts of `AFC_Hardware.cfg` you still need (e.g. toolhead filament sensor) and edit `AFC_ACE_Pro.cfg` for extruder name, pins, etc., as documented in this repo.
+
+```bash
 # 4. Restart Klipper
 sudo systemctl restart klipper
 ```
