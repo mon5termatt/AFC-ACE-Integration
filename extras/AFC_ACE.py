@@ -27,7 +27,7 @@ ACE_RECONNECT_INITIAL_DELAY = 0.25
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
-try: from extras.AFC_lane import AFCLaneState
+try: from extras.AFC_lane import AFCLane, AFCLaneState
 except: raise error(ERROR_STR.format(import_lib="AFC_lane", trace=traceback.format_exc()))
 
 try: from extras.AFC_unit import afcUnit
@@ -38,6 +38,173 @@ except: raise error(ERROR_STR.format(import_lib="AFC_ACE_protocol", trace=traceb
 
 try: from extras.AFC_ACE_discovery import AceDiscovery
 except: raise error(ERROR_STR.format(import_lib="AFC_ACE_discovery", trace=traceback.format_exc()))
+
+_lane_get_status_bridge_installed = False
+_direct_hub_bowden_installed = False
+
+
+def _install_afc_lane_direct_hub_bowden():
+    """
+    For hub: direct, AFC_lane replaces hub_obj with a lambda that only sets state/move_dis.
+    TOOL_LOAD still reads cur_hub.afc_bowden_length when homing_enabled + home_to_tool +
+    tool_start (see AFC.py), which raises AttributeError. Copy bowden lengths from the
+    unit's MockHub (or lane dist_hub) onto the direct stub for afcACE lanes only.
+    """
+    global _direct_hub_bowden_installed
+    if _direct_hub_bowden_installed:
+        return
+    _direct_hub_bowden_installed = True
+    _orig = AFCLane.handle_unit_connect
+
+    def _wrapped(self, unit_obj):
+        _orig(self, unit_obj)
+        if self.hub != "direct":
+            return
+        uo = getattr(self, "unit_obj", None)
+        # afcACE instances always define direct_tool_load_mm; avoids fragile class-name checks.
+        if uo is None or not hasattr(uo, "direct_tool_load_mm"):
+            return
+        try:
+            uo._ensure_direct_hub_lane_stub(self)
+        except Exception:
+            bow = 900.0
+            uhub = getattr(uo, "hub_obj", None)
+            if uhub is not None and hasattr(uhub, "afc_bowden_length"):
+                try:
+                    bow = float(uhub.afc_bowden_length)
+                except Exception:
+                    pass
+            try:
+                dh = float(self.dist_hub)
+                if dh > bow:
+                    bow = dh
+            except Exception:
+                pass
+            ho = getattr(self, "hub_obj", None)
+            if ho is not None:
+                ho.afc_bowden_length = bow
+                ho.afc_unload_bowden_length = bow
+
+    AFCLane.handle_unit_connect = _wrapped
+
+
+def _install_afc_lane_get_status_bridge():
+    """
+    AFCLane.get_status() returns {} until connect_done. Moonraker/KlipperScreen read
+    lane.map from printer/afc/status; an empty dict yields blank T0–Tn labels and can
+    confuse the map UI. For ACE lanes only, expose config fields (map, index, name)
+    during that window. Safe for other units: unchanged.
+    """
+    global _lane_get_status_bridge_installed
+    if _lane_get_status_bridge_installed:
+        return
+    _lane_get_status_bridge_installed = True
+    _orig = AFCLane.get_status
+
+    def _bridged_get_status(self, eventtime=None, save_to_file=False):
+        r = _orig(self, eventtime, save_to_file)
+        if r or save_to_file:
+            return r
+        u = getattr(self, "unit_obj", None)
+        if u is None or u.__class__.__name__ != "afcACE":
+            return r
+        m = self.map if self.map is not None else "T%s" % (self.index,)
+        return {
+            "name": self.name,
+            "unit": self.unit,
+            "hub": self.hub,
+            "extruder": self.extruder_name,
+            "buffer": self.buffer_name,
+            "buffer_status": None,
+            "lane": self.index,
+            "map": m,
+            "load": False,
+            "prep": False,
+            "tool_loaded": False,
+            "loaded_to_hub": False,
+            "material": self.material,
+            "remember_spool": bool(self.remember_spool)
+            if self.remember_spool is not None
+            else False,
+            "spool_id": int(self.spool_id) if self.spool_id else None,
+            "color": self.color,
+            "weight": self.weight,
+            "extruder_temp": self.extruder_temp,
+            "runout_lane": self.runout_lane,
+            "filament_status": "Unknown",
+            "filament_status_led": "0",
+            "status": AFCLaneState.NONE,
+            "dist_hub": self.dist_hub,
+            "td1_td": "",
+            "td1_color": "",
+            "td1_scan_time": "",
+        }
+
+    AFCLane.get_status = _bridged_get_status
+
+
+class _AceFilamentDrive:
+    """
+    Minimal AFC lane drive API: AFC's AFCLane.move() / move_to() call into
+    drive_stepper.move() and drive_stepper.home_to(). ACE has no MCU stepper;
+    we forward motion to the ACE USB feed/retract protocol on the selected lane.
+    """
+
+    def __init__(self, unit):
+        self._unit = unit
+        # Some lane setups touch extruder_stepper only when endstops exist; keep a stub.
+        self.extruder_stepper = self
+        self.stepper = None
+
+    def move(self, distance, speed, accel, assist_active=False):
+        lane = self._unit._ace_selected_lane
+        if lane is None:
+            logging.warning("AFC_ACE: filament move with no selected lane")
+            return
+        spd = max(10, min(80, int(speed)))
+        self._unit._ensure_connected()
+        self._unit.move_lane(lane, float(distance), spd, bool(assist_active))
+
+    def home_to(
+        self,
+        endstop_spec,
+        distance,
+        speed_mode,
+        triggered=True,
+        check_trigger=True,
+        assist_active=True,
+    ):
+        lane = self._unit._ace_selected_lane
+        if lane is None:
+            return False, 0.0, True
+        speed, accel = lane.get_speed_accel(speed_mode)
+        spd = max(10, min(80, int(speed)))
+        self._unit._ensure_connected()
+        try:
+            dist = float(distance)
+            self._unit.move_lane(lane, dist, spd, bool(assist_active))
+        except Exception as e:
+            logging.error("AFC_ACE: home_to move failed: %s", e)
+            return False, 0.0, True
+        return True, abs(dist), False
+
+    def do_enable(self, enable):
+        pass
+
+    def sync_to_extruder(self, update_current=True, extruder_name=None):
+        pass
+
+    def unsync_to_extruder(self, update_current=True):
+        pass
+
+    def set_load_current(self):
+        pass
+
+    def set_print_current(self):
+        pass
+
+    def update_rotation_distance(self, multiplier):
+        pass
 
 
 class afcACE(afcUnit):
@@ -67,19 +234,45 @@ class afcACE(afcUnit):
         # ACE manages filament internally, so hub operations are not needed
         class MockHub:
             def __init__(self):
-                self.state = True     # Always "triggered" - ACE manages filament internally
-                self.name = None      # No actual hub name
-                self.lanes = {}       # Lanes will register here instead of real hub
-                self.move_dis = 0     # Hub move distance (not used for ACE)
-                self.load_length = 0  # Hub load length (not used for ACE)
+                # TOOL_LOAD uses hub: direct for ACE; these satisfy rare attribute lookups.
+                self.state = True
+                self.name = None
+                self.lanes = {}
+                self.move_dis = 0
+                self.load_length = 0
+                self.hub_clear_move_dis = 0
+                self.afc_bowden_length = 900.0
+                self.afc_unload_bowden_length = 900.0
+                self.cut = False
 
         self.hub_obj = MockHub()
+        # Same names as [AFC_hub] — AFC TOOL_LOAD reads cur_lane.hub_obj.afc_bowden_length on the
+        # hub: direct stub; set here so MockHub + lane lambdas match your printer (see TROUBLESHOOTING).
+        _abl = config.getfloat("afc_bowden_length", 900.0)
+        self.hub_obj.afc_bowden_length = _abl
+        self.hub_obj.afc_unload_bowden_length = config.getfloat(
+            "afc_unload_bowden_length", _abl
+        )
 
         # ACE-specific configuration
         self.serial = config.get('serial', None)
         self.auto_detect = config.getboolean('auto_detect', False)
         self.device_index = config.getint('device_index', 0)
         self.baud = config.getint('baud', 115200)
+        # TOOL_LOAD (hub: direct) passes lane dist_hub; AFC default is ~60 mm — not enough for ACE
+        # to reach the extruder. Feeds use at least this length unless dist_hub is already larger.
+        self.direct_tool_load_mm = config.getfloat("direct_tool_load_mm", 2800.0)
+        # USB feed chunk size (mm per feed_filament/unwind_filament call). ACEPRO uses the same
+        # idea for sensor retries: ``incremental_feeding_length`` (default 50) in
+        # ``_feed_filament_to_verification_sensor`` (see ACEPRO/extras/ace/instance.py). We repeat
+        # RPCs until the full distance is commanded. Prefer ``ace_feed_chunk_mm`` if set; else
+        # ``incremental_feeding_length`` for drop-in ACEPRO parity; 0 = single RPC per move.
+        if config.fileconfig.has_option(config.get_name(), "ace_feed_chunk_mm"):
+            self.ace_feed_chunk_mm = config.getfloat("ace_feed_chunk_mm")
+        else:
+            self.ace_feed_chunk_mm = config.getfloat(
+                "incremental_feeding_length", 50.0
+            )
 
         # ACE protocol handler
         self.protocol = None
@@ -95,8 +288,91 @@ class afcACE(afcUnit):
         self.connected = False
         self._ace_connect_timer = None
         self._reconnect_backoff = ACE_RECONNECT_BACKOFF_MIN
+        self._ace_selected_lane = None
+        self.drive_stepper_obj = _AceFilamentDrive(self)
 
         logging.info(f"AFC_ACE: Initialized unit '{self.name}'")
+
+    def _ensure_direct_hub_lane_stub(self, lane: AFCLane):
+        """
+        For hub: direct, AFCLane sets hub_obj to a lambda. AFC TOOL_LOAD still uses
+        cur_hub.afc_bowden_length / afc_unload_bowden_length — set them from [AFC_ACE]
+        and lane dist_hub. Called after lane connect and on every select_lane.
+        """
+        if getattr(lane, "hub", None) != "direct":
+            return
+        ho = getattr(lane, "hub_obj", None)
+        if ho is None:
+            return
+        bow = float(getattr(self.hub_obj, "afc_bowden_length", 900.0))
+        ubl = float(
+            getattr(self.hub_obj, "afc_unload_bowden_length", bow)
+        )
+        try:
+            dh = float(lane.dist_hub)
+            if dh > bow:
+                bow = dh
+        except Exception:
+            pass
+        ho.afc_bowden_length = bow
+        ho.afc_unload_bowden_length = ubl
+
+    def select_lane(self, lane: AFCLane, sel_prep: bool = False):
+        self._ace_selected_lane = lane
+        self._ensure_direct_hub_lane_stub(lane)
+        return True, 0.0
+
+    def load_then_home(self, lane, distance, assist_active, endstop):
+        """
+        AFC ``TOOL_LOAD`` for ``hub: direct`` calls ``load_then_home(lane, dist_hub, ...)``.
+        ``dist_hub`` defaults to a small value (often 60 mm) meant for a physical hub gap, not
+        for ACE Pro's full path to the nozzle. Bump to ``direct_tool_load_mm`` when the requested
+        distance is smaller so the ACE actually runs a long feed (same order as ACEPRO's
+        ``toolchange_load_length``).
+        """
+        try:
+            d = float(distance)
+        except Exception:
+            d = 0.0
+        target = float(self.direct_tool_load_mm)
+        if getattr(lane, "hub", None) == "direct" and d < target:
+            logging.info(
+                "AFC_ACE: load_then_home lane=%s direct feed %.0f mm -> %.0f mm "
+                "(lane dist_hub or [AFC_ACE] direct_tool_load_mm to tune)",
+                lane.name,
+                d,
+                target,
+            )
+            try:
+                self.gcode.respond_info(
+                    "AFC_ACE: feeding %.0f mm to toolhead for direct load (was %.0f mm)"
+                    % (target, d)
+                )
+            except Exception:
+                pass
+            d = target
+        return super().load_then_home(lane, d, assist_active, endstop)
+
+    def _print_function_not_defined(self, name):
+        """
+        afcUnit reports unimplemented hooks via self.afc.gcode(msg), but GCodeDispatch
+        is not callable. ACE integration overrides this so missing hooks cannot shutdown Klipper.
+        """
+        msg = "{} function not defined for {}".format(name, self.name)
+        logging.warning(msg)
+        try:
+            gcode = self.printer.lookup_object("gcode")
+            lines = [l.strip() for l in msg.strip().split("\n")]
+            gcode.respond_raw("// " + "\n// ".join(lines))
+        except Exception:
+            pass
+
+    def prep_load(self, lane: AFCLane):
+        """
+        Base afcUnit.prep_load mistakenly calls _print_function_not_defined(eject_lane.__name__).
+        ACE reports the correct function name until a real prep_load is implemented.
+        """
+        self._print_function_not_defined(self.prep_load.__name__)
 
     def handle_connect(self):
         """
@@ -104,6 +380,10 @@ class afcACE(afcUnit):
         Called when the printer connects.
         """
         super().handle_connect()
+
+        # hub: direct lanes get a lambda hub_obj; ensure bowden attrs exist before any TOOL_LOAD.
+        for _ln in list(self.lanes.values()):
+            self._ensure_direct_hub_lane_stub(_ln)
 
         # Banner for PREP / status (Mainsail success--text)
         _ace_banner = (
@@ -195,7 +475,12 @@ class afcACE(afcUnit):
         self._cleanup_failed_connect()
 
         try:
-            self.protocol = AceProtocol(self.serial, self.baud)
+            self.protocol = AceProtocol(
+                self.serial,
+                self.baud,
+                reactor=self.printer.get_reactor(),
+                feed_chunk_mm=self.ace_feed_chunk_mm,
+            )
             if not self.protocol.connect():
                 logging.warning("AFC_ACE: Failed to open serial %s", self.serial)
                 self._cleanup_failed_connect()
@@ -363,8 +648,16 @@ class afcACE(afcUnit):
             desc="Feed filament from an ACE slot (UNIT=<name> INDEX=0-3 LENGTH=<mm> SPEED=10-80)"
         )
         self.gcode.register_mux_command(
+            "AFC_FEED", "UNIT", self.name, self.cmd_ACE_FEED,
+            desc="Same as ACE_FEED (common name mix-up; LENGTH/LEN/DIST=<mm>)"
+        )
+        self.gcode.register_mux_command(
             "ACE_RETRACT", "UNIT", self.name, self.cmd_ACE_RETRACT,
             desc="Retract filament back into an ACE slot (UNIT=<name> INDEX=0-3 LENGTH=<mm> SPEED=10-80)"
+        )
+        self.gcode.register_mux_command(
+            "AFC_RETRACT", "UNIT", self.name, self.cmd_ACE_RETRACT,
+            desc="Same as ACE_RETRACT (LENGTH/LEN/DIST=<mm>)"
         )
         self.gcode.register_mux_command(
             "ACE_START_DRYING", "UNIT", self.name, self.cmd_ACE_START_DRYING,
@@ -448,7 +741,13 @@ class afcACE(afcUnit):
 
         length = gcmd.get_float("LENGTH", None)
         if length is None:
-            raise error("AFC_ACE: Missing LENGTH parameter")
+            length = gcmd.get_float("LEN", None)
+        if length is None:
+            length = gcmd.get_float("DIST", None)
+        if length is None:
+            raise error(
+                "AFC_ACE: Missing LENGTH parameter (aliases: LEN, DIST)"
+            )
         if length <= 0:
             raise error("AFC_ACE: LENGTH must be > 0")
 
@@ -457,36 +756,40 @@ class afcACE(afcUnit):
         return index, length, speed
 
     def cmd_ACE_FEED(self, gcmd):
-        return self._cmd_guard("ACE_FEED", lambda: self._cmd_ACE_FEED(gcmd))
+        label = gcmd.get_command()
+        return self._cmd_guard(label, lambda: self._cmd_ACE_FEED(gcmd))
 
     def _cmd_ACE_FEED(self, gcmd):
         self._ensure_connected()
+        cmd = gcmd.get_command()
         index, length, speed = self._parse_index_speed_len(gcmd)
         ok = self._proto_retry(
             "feed",
             lambda: self.protocol.feed(index, length, speed),
         )
         if not ok:
-            raise error(f"AFC_ACE: ACE_FEED failed (unit={self.name} index={index})")
+            raise error(f"AFC_ACE: {cmd} failed (unit={self.name} index={index})")
         self._respond_ok(
-            "ACE_FEED",
+            cmd,
             "index=%s length=%s speed=%s" % (index, int(length), speed),
         )
 
     def cmd_ACE_RETRACT(self, gcmd):
-        return self._cmd_guard("ACE_RETRACT", lambda: self._cmd_ACE_RETRACT(gcmd))
+        label = gcmd.get_command()
+        return self._cmd_guard(label, lambda: self._cmd_ACE_RETRACT(gcmd))
 
     def _cmd_ACE_RETRACT(self, gcmd):
         self._ensure_connected()
+        cmd = gcmd.get_command()
         index, length, speed = self._parse_index_speed_len(gcmd)
         ok = self._proto_retry(
             "retract",
             lambda: self.protocol.retract(index, length, speed),
         )
         if not ok:
-            raise error(f"AFC_ACE: ACE_RETRACT failed (unit={self.name} index={index})")
+            raise error(f"AFC_ACE: {cmd} failed (unit={self.name} index={index})")
         self._respond_ok(
-            "ACE_RETRACT",
+            cmd,
             "index=%s length=%s speed=%s" % (index, int(length), speed),
         )
 
@@ -661,6 +964,7 @@ class afcACE(afcUnit):
             speed: Speed (10-80)
             assist: Enable feed assist during move
         """
+        self._ensure_connected()
         slot = self.get_slot_for_lane(lane)
 
         # Clamp speed to ACE limits (10-80)
@@ -671,26 +975,112 @@ class afcACE(afcUnit):
                 # Feed forward
                 logging.debug(f"AFC_ACE: Feed slot {slot} distance {distance}mm speed {speed}")
 
-                if assist:
-                    self.protocol.set_feed_assist(slot, True)
+                # ACEPRO disables feed assist before starting feed_filament; leaving assist on
+                # can leave the drive idle or return FORBIDDEN on some firmware builds.
+                try:
+                    self.protocol.set_feed_assist(slot, False)
+                except Exception:
+                    pass
 
                 success = self.protocol.feed(slot, distance, speed)
 
+                if assist and success:
+                    try:
+                        self.protocol.set_feed_assist(slot, True)
+                    except Exception:
+                        pass
+
                 if not success:
-                    logging.error(f"AFC_ACE: Feed command failed for slot {slot}")
+                    msg = "AFC_ACE: ACE feed failed (unit=%s slot=%s len=%s mm)" % (
+                        self.name,
+                        slot,
+                        distance,
+                    )
+                    logging.error(msg)
+                    raise error(msg)
 
             else:
                 # Retract backward
                 logging.debug(f"AFC_ACE: Retract slot {slot} distance {abs(distance)}mm speed {speed}")
 
+                try:
+                    self.protocol.set_feed_assist(slot, False)
+                except Exception:
+                    pass
+
                 success = self.protocol.retract(slot, abs(distance), speed)
 
                 if not success:
-                    logging.error(f"AFC_ACE: Retract command failed for slot {slot}")
+                    msg = "AFC_ACE: ACE retract failed (unit=%s slot=%s len=%s mm)" % (
+                        self.name,
+                        slot,
+                        abs(distance),
+                    )
+                    logging.error(msg)
+                    raise error(msg)
 
         except Exception as e:
             logging.error(f"AFC_ACE: Error moving lane '{lane.name}': {e}")
             raise
+
+    def eject_lane(self, lane: AFCLane):
+        """
+        Retract filament into the ACE for this lane so the spool can be removed.
+
+        Used by AFC ``LANE_UNLOAD``. Retracts in chunks until the device reports
+        the slot as empty or a retract fails / iteration limit is reached.
+        """
+        self._ensure_connected()
+        if not self.lane_to_slot and self.lanes:
+            self._build_lane_mapping()
+        slot = self.get_slot_for_lane(lane)
+        speed = max(10, min(80, int(self.short_moves_speed)))
+
+        try:
+            status = self._proto_retry("get_status", self.protocol.get_status)
+            if status and isinstance(status.get("slots"), list):
+                slots = status["slots"]
+                if 0 <= slot < len(slots):
+                    if slots[slot].get("status") == "empty":
+                        self.gcode.respond_info(
+                            "AFC_ACE: slot %s already empty; nothing to eject"
+                            % slot
+                        )
+                        return
+        except Exception:
+            pass
+
+        chunk = int(min(500, max(50, self.max_move_dis)))
+        max_passes = 40
+        for n in range(max_passes):
+            ok = self._proto_retry(
+                "eject_retract",
+                lambda: self.protocol.retract(slot, chunk, speed),
+            )
+            if not ok:
+                self.gcode.respond_info(
+                    "AFC_ACE: retract stopped (protocol error) slot=%s pass=%s"
+                    % (slot, n + 1)
+                )
+                break
+            status = self._proto_retry("get_status", self.protocol.get_status)
+            if not status:
+                continue
+            slots = status.get("slots")
+            if isinstance(slots, list) and 0 <= slot < len(slots):
+                if slots[slot].get("status") == "empty":
+                    logging.info(
+                        "AFC_ACE: eject_lane slot %s empty after %s retract pass(es)",
+                        slot,
+                        n + 1,
+                    )
+                    break
+
+        logging.info(
+            "AFC_ACE: eject_lane finished for lane '%s' slot %s",
+            lane.name,
+            slot,
+        )
 
     def get_lane_status(self, lane) -> str:
         """
@@ -797,6 +1187,7 @@ class afcACE(afcUnit):
         slot = self.get_slot_for_lane(cur_lane)
 
         try:
+            self._ensure_connected()
             # Get ACE slot status
             status = self.protocol.get_status()
 
@@ -807,56 +1198,58 @@ class afcACE(afcUnit):
                 msg = "<span class=warning--text>UNKNOWN (Communication Error)</span>"
                 cur_lane.status = AFCLaneState.NONE
                 cur_lane.prep_state = True  # Set prep_state (exposed as 'prep' in API)
-                cur_lane.load_state = True  # Set load_state (exposed as 'load' in API)
-                logging.info(f"AFC_ACE: Set lane '{cur_lane.name}' prep_state={cur_lane.prep_state} load_state={cur_lane.load_state}")
+                cur_lane._load_state = True
+                logging.info(
+                    f"AFC_ACE: Set lane '{cur_lane.name}' prep_state={cur_lane.prep_state} load(raw)={cur_lane.raw_load_state}"
+                )
                 succeeded = True  # Don't fail prep for communication errors
-                return msg, succeeded
-
-            slot_info = status['slots'][slot]
-            slot_status = slot_info['status']
-
-            # Map ACE status to AFC states
-            if slot_status == 'empty':
-                self.afc.function.afc_led(cur_lane.led_not_ready, cur_lane.led_index)
-                msg = 'EMPTY READY FOR SPOOL'
-                cur_lane.status = AFCLaneState.NONE
-                cur_lane.prep_state = True  # Lane is prepped (empty, ready for spool)
-                cur_lane.load_state = True
-                succeeded = True
-
-            elif slot_status == 'ready':
-                self.afc.function.afc_led(cur_lane.led_ready, cur_lane.led_index)
-                msg = "<span class=success--text>LOCKED AND LOADED</span>"
-                cur_lane.status = AFCLaneState.LOADED
-                cur_lane.prep_state = True  # Lane is prepped (filament loaded and ready)
-                cur_lane.load_state = True
-                succeeded = True
-
-                # Illuminate spool LED
-                self.afc.function.afc_led(cur_lane.led_spool_illum, cur_lane.led_spool_index)
-
-                # Check if loaded into toolhead
-                if cur_lane.tool_loaded:
-                    if cur_lane.extruder_obj and cur_lane.extruder_obj.lane_loaded == cur_lane.name:
-                        self.afc.current = cur_lane.name
-                        msg += "<span class=primary--text> in ToolHead</span>"
-
-                        if self.afc.function.get_current_lane() == cur_lane.name:
-                            self.afc.spool.set_active_spool(cur_lane.spool_id)
-                            cur_lane.unit_obj.lane_tool_loaded(cur_lane)
-                            cur_lane.status = AFCLaneState.TOOLED
-
-            elif slot_status == 'error':
-                self.afc.function.afc_led(cur_lane.led_fault, cur_lane.led_index)
-                msg = "<span class=error--text>SLOT ERROR</span>"
-                cur_lane.status = AFCLaneState.ERROR
-                succeeded = False
 
             else:
-                # Unknown status
-                self.afc.function.afc_led(cur_lane.led_fault, cur_lane.led_index)
-                msg = f"<span class=warning--text>UNKNOWN STATUS: {slot_status}</span>"
-                succeeded = False
+                slot_info = status['slots'][slot]
+                slot_status = slot_info['status']
+
+                # Map ACE status to AFC states
+                if slot_status == 'empty':
+                    self.afc.function.afc_led(cur_lane.led_not_ready, cur_lane.led_index)
+                    msg = 'EMPTY READY FOR SPOOL'
+                    cur_lane.status = AFCLaneState.NONE
+                    cur_lane.prep_state = True  # Lane is prepped (empty, ready for spool)
+                    cur_lane._load_state = True
+                    succeeded = True
+
+                elif slot_status == 'ready':
+                    self.afc.function.afc_led(cur_lane.led_ready, cur_lane.led_index)
+                    msg = "<span class=success--text>LOCKED AND LOADED</span>"
+                    cur_lane.status = AFCLaneState.LOADED
+                    cur_lane.prep_state = True  # Lane is prepped (filament loaded and ready)
+                    cur_lane._load_state = True
+                    succeeded = True
+
+                    # Illuminate spool LED
+                    self.afc.function.afc_led(cur_lane.led_spool_illum, cur_lane.led_spool_index)
+
+                    # Check if loaded into toolhead
+                    if cur_lane.tool_loaded:
+                        if cur_lane.extruder_obj and cur_lane.extruder_obj.lane_loaded == cur_lane.name:
+                            self.afc.current = cur_lane.name
+                            msg += "<span class=primary--text> in ToolHead</span>"
+
+                            if self.afc.function.get_current_lane() == cur_lane.name:
+                                self.afc.spool.set_active_spool(cur_lane.spool_id)
+                                cur_lane.unit_obj.lane_tool_loaded(cur_lane)
+                                cur_lane.status = AFCLaneState.TOOLED
+
+                elif slot_status == 'error':
+                    self.afc.function.afc_led(cur_lane.led_fault, cur_lane.led_index)
+                    msg = "<span class=error--text>SLOT ERROR</span>"
+                    cur_lane.status = AFCLaneState.ERROR
+                    succeeded = False
+
+                else:
+                    # Unknown status
+                    self.afc.function.afc_led(cur_lane.led_fault, cur_lane.led_index)
+                    msg = f"<span class=warning--text>UNKNOWN STATUS: {slot_status}</span>"
+                    succeeded = False
 
         except Exception as e:
             logging.error(f"AFC_ACE: Error during system test: {e}")
@@ -864,7 +1257,18 @@ class afcACE(afcUnit):
             msg = "<span class=error--text>TEST ERROR</span>"
             succeeded = False
 
-        return msg, succeeded
+        # Same as Box Turtle: register T0/T1/… with Klipper so CHANGE_TOOL runs on Tn.
+        if assignTcmd:
+            self.afc.function.TcmdAssign(cur_lane)
+        cur_lane.send_lane_data()
+        cur_lane.do_enable(False)
+        self.logger.info(
+            "{lane_name} tool cmd: {tcmd:3} {msg}".format(
+                lane_name=cur_lane.name, tcmd=cur_lane.map, msg=msg
+            )
+        )
+        cur_lane.set_afc_prep_done()
+        return succeeded
 
     def lane_tool_loaded(self, cur_lane):
         """
@@ -942,6 +1346,8 @@ class afcACE(afcUnit):
 
 def load_config_prefix(config):
     """Klipper load function for [AFC_ACE name] sections"""
+    _install_afc_lane_get_status_bridge()
+    _install_afc_lane_direct_hub_bowden()
     return afcACE(config)
 
 # Also support direct loading for backwards compatibility

@@ -15,6 +15,7 @@ import json
 import serial
 import logging
 import threading
+import time
 from typing import Dict, Any, Optional, Tuple
 
 # Protocol Constants
@@ -30,6 +31,10 @@ LANES_PER_ACE = 4
 DEFAULT_BAUD_RATE = 115200
 DEFAULT_TIMEOUT = 2.0
 REQUEST_TIMEOUT = 2.0
+# After feed_filament, wait length/speed + margin if the RPC returns early. For chunked feeds,
+# only the final chunk uses the full margin; mid-chunks use a small margin so motion stays fluid.
+FEED_SYNC_MARGIN_FULL_S = 1.5
+FEED_SYNC_MARGIN_CHUNK_MID_S = 0.12
 
 
 def calc_crc(buffer: bytes) -> int:
@@ -167,7 +172,14 @@ class AceProtocol:
     Manages serial communication and command execution.
     """
 
-    def __init__(self, port: str, baud: int = DEFAULT_BAUD_RATE, timeout: float = DEFAULT_TIMEOUT):
+    def __init__(
+        self,
+        port: str,
+        baud: int = DEFAULT_BAUD_RATE,
+        timeout: float = DEFAULT_TIMEOUT,
+        reactor: Any = None,
+        feed_chunk_mm: float = 0.0,
+    ):
         """
         Initialize ACE protocol handler.
 
@@ -175,14 +187,37 @@ class AceProtocol:
             port: Serial port path (e.g., '/dev/ttyACM0' or '/dev/serial/by-path/...')
             baud: Baud rate (default 115200)
             timeout: Serial timeout in seconds
+            reactor: Klipper reactor (optional). When set, long waits use ``reactor.pause``
+                instead of ``time.sleep`` so ``verify_heater`` and other timers keep running.
+            feed_chunk_mm: If > 0, split feed/retract into multiple USB calls of at most this
+                many mm. Matches the spirit of ACEPRO's ``incremental_feeding_length`` loop
+                (``_feed_filament_to_verification_sensor``) when the first ``feed_filament`` does
+                not move enough. Use ``0`` for one RPC per move.
         """
         self.port = port
         self.baud = baud
         self.timeout = timeout
+        self._reactor = reactor
+        self._feed_chunk_mm = float(feed_chunk_mm)
         self.serial = None
         self._request_id = 0
         self.read_buffer = bytearray()
         self._lock = threading.Lock()  # Thread-safe access to serial port
+
+    def _pause_for(self, delay: float) -> None:
+        """Yield the Klipper reactor during waits when available (see module docstring)."""
+        if delay <= 0:
+            return
+        r = self._reactor
+        if r is not None:
+            r.pause(r.monotonic() + delay)
+        else:
+            time.sleep(delay)
+
+    def _monotonic(self) -> float:
+        if self._reactor is not None:
+            return self._reactor.monotonic()
+        return time.monotonic()
 
     def connect(self) -> bool:
         """
@@ -215,8 +250,7 @@ class AceProtocol:
             logging.info(f"AFC_ACE: Connected to {self.port} at {self.baud} baud")
 
             # Give device time to stabilize after connection
-            import time
-            time.sleep(0.2)  # Increased from 0.1s to 0.2s
+            self._pause_for(0.2)
 
             return True
         except serial.SerialException as e:
@@ -264,17 +298,15 @@ class AceProtocol:
 
             try:
                 # Small delay before sending to prevent overwhelming device
-                import time
-                time.sleep(0.05)
+                self._pause_for(0.05)
 
                 self.serial.write(packet)
                 self.serial.flush()
 
                 # Wait for response
-                import time
-                start_time = time.time()
+                start_time = self._monotonic()
 
-                while (time.time() - start_time) < timeout:
+                while (self._monotonic() - start_time) < timeout:
                     if self.serial.in_waiting > 0:
                         self.read_buffer += self.serial.read(self.serial.in_waiting)
 
@@ -294,7 +326,7 @@ class AceProtocol:
                                 logging.error(f"AFC_ACE: Command error: {response['error']}")
                                 return None
 
-                    time.sleep(0.05)
+                    self._pause_for(0.05)
 
                 logging.warning(f"AFC_ACE: Command '{method}' timed out after {timeout}s")
                 return None
@@ -314,9 +346,8 @@ class AceProtocol:
                             self.serial.write(packet)
                             self.serial.flush()
 
-                            import time
-                            start_time = time.time()
-                            while (time.time() - start_time) < timeout:
+                            start_time = self._monotonic()
+                            while (self._monotonic() - start_time) < timeout:
                                 if self.serial.in_waiting > 0:
                                     self.read_buffer += self.serial.read(self.serial.in_waiting)
                                     packet_bytes, self.read_buffer = AcePacket.find_packet_in_buffer(self.read_buffer)
@@ -328,7 +359,7 @@ class AceProtocol:
                                             return response['result']
                                         elif response and 'error' in response:
                                             return None
-                                time.sleep(0.05)
+                                self._pause_for(0.05)
                         except Exception as retry_error:
                             logging.error(f"AFC_ACE: Retry after reconnect failed: {retry_error}")
                     else:
@@ -368,9 +399,52 @@ class AceProtocol:
         """
         return self.send_command("get_filament_info", {"index": int(index)})
 
+    @staticmethod
+    def _rpc_ok(result: Optional[Dict[str, Any]]) -> bool:
+        if result is None:
+            return False
+        if isinstance(result, dict) and result.get("code", 0) != 0:
+            return False
+        return True
+
+    def _sync_motion_after_rpc(
+        self,
+        label: str,
+        length: float,
+        speed: int,
+        rpc_elapsed: float,
+        sync_margin_s: float = FEED_SYNC_MARGIN_FULL_S,
+    ) -> None:
+        """
+        ACE Pro often returns feed_filament RPC success before the mechanical move
+        finishes (see ValgACE ACE_FEED dwell). If we return to Klipper too early, only
+        a short pulse (~tens of mm) may run before the next command.
+
+        Chunked feeds pass a small ``sync_margin_s`` for non-final segments so the drive
+        does not pause ~0.5s after every short segment.
+        """
+        spd = max(1, int(speed))
+        ln = max(1, int(length))
+        need = float(ln) / float(spd) + sync_margin_s
+        if rpc_elapsed + 0.05 < need:
+            extra = need - rpc_elapsed
+            logfn = logging.info if sync_margin_s >= 1.0 else logging.debug
+            logfn(
+                "AFC_ACE: %s RPC returned in %.2fs; waiting %.2fs for motion (est. %.2fs total, margin=%.2fs)",
+                label,
+                rpc_elapsed,
+                extra,
+                need,
+                sync_margin_s,
+            )
+            self._pause_for(extra)
+
     def feed(self, index: int, length: float, speed: int) -> bool:
         """
         Feed filament forward.
+
+        ACE Pro firmware expects ``feed_filament`` with ``index``, ``length``, ``speed``
+        (see ACEPRO PROTOCOL.md). Older aliases ``feed`` / ``len`` do not run the motor.
 
         Args:
             index: Lane index (0-3)
@@ -380,16 +454,59 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        result = self.send_command("feed", {
-            "index": index,
-            "len": int(length),
-            "speed": speed
-        })
-        return result is not None
+        spd = max(1, int(speed))
+        total = max(1, int(round(float(length))))
+        idx = int(index)
+        cap = int(self._feed_chunk_mm) if self._feed_chunk_mm > 0.0 else 0
+        remaining = total
+        nchunk = 0
+        while remaining > 0:
+            if cap > 0:
+                this_len = min(remaining, cap)
+            else:
+                this_len = remaining
+            this_len = max(1, int(this_len))
+            remaining_after = remaining - this_len
+            est_s = float(this_len) / float(spd)
+            timeout = min(600.0, max(REQUEST_TIMEOUT, est_s * 2.0 + 15.0))
+            t0 = self._monotonic()
+            result = self.send_command(
+                "feed_filament",
+                {"index": idx, "length": this_len, "speed": spd},
+                timeout=timeout,
+            )
+            elapsed = self._monotonic() - t0
+            if not self._rpc_ok(result):
+                return False
+            mid_chunk = cap > 0 and remaining_after > 0
+            sync_margin = (
+                FEED_SYNC_MARGIN_CHUNK_MID_S
+                if mid_chunk
+                else FEED_SYNC_MARGIN_FULL_S
+            )
+            self._sync_motion_after_rpc(
+                "feed_filament",
+                float(this_len),
+                spd,
+                elapsed,
+                sync_margin_s=sync_margin,
+            )
+            remaining = remaining_after
+            nchunk += 1
+        if cap > 0 and nchunk > 1:
+            logging.info(
+                "AFC_ACE: feed_filament completed %s chunks (%s mm total, chunk max %s mm)",
+                nchunk,
+                total,
+                cap,
+            )
+        return True
 
     def retract(self, index: int, length: float, speed: int) -> bool:
         """
-        Retract filament backward.
+        Retract (unwind) filament.
+
+        Firmware expects ``unwind_filament`` with ``index``, ``length``, ``speed``, ``mode``.
 
         Args:
             index: Lane index (0-3)
@@ -399,16 +516,48 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        result = self.send_command("back", {
-            "index": index,
-            "len": int(length),
-            "speed": speed
-        })
-        return result is not None
+        spd = max(1, int(speed))
+        total = max(1, int(round(float(length))))
+        idx = int(index)
+        cap = int(self._feed_chunk_mm) if self._feed_chunk_mm > 0.0 else 0
+        remaining = total
+        nchunk = 0
+        while remaining > 0:
+            if cap > 0:
+                this_len = min(remaining, cap)
+            else:
+                this_len = remaining
+            this_len = max(1, int(this_len))
+            est_s = float(this_len) / float(spd)
+            timeout = min(600.0, max(REQUEST_TIMEOUT, est_s * 2.0 + 15.0))
+            result = self.send_command(
+                "unwind_filament",
+                {
+                    "index": idx,
+                    "length": this_len,
+                    "speed": spd,
+                    "mode": 0,
+                },
+                timeout=timeout,
+            )
+            if not self._rpc_ok(result):
+                return False
+            remaining -= this_len
+            nchunk += 1
+        if cap > 0 and nchunk > 1:
+            logging.info(
+                "AFC_ACE: unwind_filament completed %s chunks (%s mm total, chunk max %s mm)",
+                nchunk,
+                total,
+                cap,
+            )
+        return True
 
     def set_feed_assist(self, index: int, enable: bool) -> bool:
         """
         Enable/disable feed assist for a lane.
+
+        Firmware: ``start_feed_assist`` / ``stop_feed_assist``.
 
         Args:
             index: Lane index (0-3)
@@ -417,10 +566,15 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        method = "feed_assist" if enable else "feed_assist_off"
-        params = {"index": index} if enable else None
-        result = self.send_command(method, params)
-        return result is not None
+        if enable:
+            result = self.send_command(
+                "start_feed_assist", {"index": int(index)}
+            )
+        else:
+            result = self.send_command(
+                "stop_feed_assist", {"index": int(index)}
+            )
+        return self._rpc_ok(result)
 
     def start_dryer(self, temp: int, duration: int = 240) -> bool:
         """

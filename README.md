@@ -142,6 +142,16 @@ T0      # Load filament from lane 1
 T1      # Switch to lane 2
 ```
 
+### ACE lane configuration (required for tool loads)
+
+Add **`hub: direct`** to **each** `[AFC_lane …]` that points at an ACE unit. AFC’s `TOOL_LOAD` path expects either a real `[AFC_hub]` or **direct** loading; ACE has no AFC hub filament sensor, so **direct** is the supported mode. Without it, tool changes can fail with “Hub not clear” or show **no ACE feed motion** because AFC never enters the load sequence.
+
+**Feed length:** for `hub: direct`, AFC’s first toolhead feed uses each lane’s **`dist_hub`** (often the AFC default **~60 mm**). That is not enough for ACE Pro to reach the nozzle. The ACE driver bumps that to **`direct_tool_load_mm`** on **`[AFC_ACE …]`** (default **2800 mm**, similar to ACEPRO’s tool-change feed). Tune with **`direct_tool_load_mm`** and/or a larger **`dist_hub`** on the lane.
+
+**KlipperScreen AFC panel:** it only lists lanes whose Klipper name starts with lowercase **`lane`** (for example `[AFC_lane lane1]`). Section names like `LANE1` or `slot1` are ignored, so **T0–T3** (the map dropdown) will not populate. The integration also bridges `get_status` for ACE so `map` is visible in `printer/afc/status` before the lane finishes its full connect sequence.
+
+Filament moves from AFC (`LANE_MOVE`, `TOOL_LOAD`, homing-style moves, etc.) are forwarded to the ACE over USB via a small virtual **drive** object in `extras/AFC_ACE.py` (`drive_stepper_obj`).
+
 ## Documentation
 
 | Document | Description |

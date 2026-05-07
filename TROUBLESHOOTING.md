@@ -87,6 +87,37 @@ cp ~/AFC-ACE-Integration/config/AFC_ACE_minimal.cfg ~/printer_data/config/AFC/AF
 
 This is guaranteed to work without hub errors.
 
+## Unknown command: `T0`, `T1`, …
+
+AFC registers `T0`–`Tn` as real G-code commands during **PREP** (`TcmdAssign`), same as Box Turtle. If Klipper says **Unknown command: "T0"**:
+
+1. Run **`PREP`** once after a clean start (the ACE driver must call `TcmdAssign` from `system_Test`; older `AFC_ACE.py` builds skipped this).
+2. Restart Klipper after updating the ACE integration, then run **`PREP`** again.
+3. Remove or rename any **`[gcode_macro T0]`** (etc.) in `printer.cfg` that would conflict with AFC’s registration. If a `T0` handler already exists, AFC logs a mapping error and `T0` stays unregistered.
+
+### ACE motor does not turn during load / retract
+
+Usually **not** “feed assist must be on.” The ACE Pro USB API expects **`feed_filament`** (params `length`, not `len`) and **`unwind_filament`** for retracts, plus **`start_feed_assist` / `stop_feed_assist`**. An older integration that called `feed` / `back` / `feed_assist` can get responses that never spin the motor. Current `AFC_ACE_protocol.py` matches **ACEPRO `PROTOCOL.md`**. Feed assist is turned **off** before each feed (same pattern as ACEPRO), then turned on again after a successful long feed if AFC asked for assist.
+
+### ACE does not pull much filament on `T0` / `TOOL_LOAD`
+
+AFC’s direct load uses **`dist_hub`** for the first feed (default often **~60 mm**). ACE Pro needs a **long** feed to the extruder (often **2500–3500 mm**). The driver increases any shorter **`hub: direct`** request to **`[AFC_ACE …] direct_tool_load_mm`** (default **2800**). Set **`direct_tool_load_mm`** and/or **`dist_hub`** on each lane to match your machine. If feeds still do nothing, check **`klippy.log`** for **ACE feed failed** (USB/protocol errors now raise instead of failing silently).
+
+### Internal error on `CHANGE_TOOL`: `'function' object has no attribute 'afc_bowden_length'`
+
+AFC’s `TOOL_LOAD` reads **`cur_hub.afc_bowden_length`** in some paths (e.g. `homing_enabled` + `home_to_tool` + toolhead sensor). For **`hub: direct`**, stock AFC sets `hub_obj` to a **lambda** with only a few fields — it does not set bowden lengths unless the ACE driver patches it.
+
+1. Use current **`AFC_ACE.py`**: it copies **`afc_bowden_length`** / **`afc_unload_bowden_length`** from **`[AFC_ACE …]`** onto that lambda after connect and on every **`select_lane`**.
+2. Set the same options you use on a Turtle **`[AFC_hub …]`** (mm along the filament path used for homing math), for example:
+
+```ini
+[AFC_ACE ace1]
+afc_bowden_length: 1200
+afc_unload_bowden_length: 1200
+```
+
+If **`dist_hub`** on a lane is **larger**, that value wins for the lambda’s **`afc_bowden_length`**. Restart Klipper after editing.
+
 ---
 
 ## "No ACE devices found" Error

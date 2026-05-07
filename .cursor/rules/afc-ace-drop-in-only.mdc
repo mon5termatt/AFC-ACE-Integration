@@ -1,0 +1,23 @@
+---
+description: AFC-ACE-Integration is drop-in only; never edit other repos (AFC-Klipper-Add-On, Klipper, etc.)
+alwaysApply: true
+---
+
+# AFC-ACE-Integration: drop-in scope only
+
+This repository is a **drop-in patch** so **Anycubic ACE Pro** works with **AFC for Klipper**. All implementation changes belong **here**, not in upstream AFC or Klipper trees.
+
+## Do
+
+- Edit only files under **`AFC-ACE-Integration/`** (this repo), e.g. `extras/AFC_ACE.py`, `extras/AFC_ACE_protocol.py`, `extras/AFC_ACE_discovery.py`, `README.md`, and tests/docs in this tree.
+- Fix AFC base-class gaps, protocol issues, or Klipper integration bugs by **overriding methods on `afcACE`**, adding helpers, or extending protocol/discovery modules **in this repo**.
+- Assume users **symlink or copy** `extras/` from this repo into their Klipper `klippy/extras/` (or use their documented install path).
+
+## Do not
+
+- Modify **`AFC-Klipper-Add-On/`**, **`klipper/`**, **`printer_data/`**, or any other sibling repo unless the user **explicitly** asks to change that tree.
+- “Fix” `afcUnit` / `AFC.py` / stock AFC extras in the Armored Turtle add-on when the same outcome can be achieved with an **`afcACE`** override or a new file **in this repo**.
+
+## Rationale
+
+Changes outside this repo are hard to ship, review, and merge with upstream AFC-Klipper-Add-On. Keeping patches here preserves a **single installable unit** for ACE Pro support.
