@@ -276,9 +276,12 @@ This project builds upon excellent work by:
   - Multi-material management framework
   - Macro system and lane management
 
-- **[KlipperACE](https://github.com/topeysoft/MultiACEManager)** by topeysoft
+- **[BunnyACE](https://github.com/BlackFrogKok/BunnyACE)** by BlackFrogKok
   - ACE Pro protocol implementation
   - USB auto-detection system
+
+- **[ACEPRO](https://github.com/Kobra-S1/ACEPRO)** by Kobra-S1
+  - Reference Klipper integration and ACE Pro behaviors that informed this project
 
 ### Special Thanks
 - **Armored Turtle Community** - AFC development and support
@@ -292,8 +295,9 @@ This project is licensed under the MIT License - see [LICENSE](./LICENSE) file f
 ### Code Attribution
 
 This project incorporates code adapted from:
-- **KlipperACE** - Protocol and discovery code (~580 lines)
+- **BunnyACE** - Protocol and discovery code
 - **AFC-Klipper-Add-On** - Interface implementation
+- **ACEPRO** - Klipper integration and ACE Pro behaviors
 
 All adapted code is clearly attributed and compatible with MIT licensing.
 

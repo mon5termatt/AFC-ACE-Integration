@@ -11,8 +11,18 @@ Implements AFC unit interface for ACE Pro hardware
 
 import traceback
 import logging
+import time
 from configparser import Error as error
 from datetime import datetime
+
+# USB RPC attempts per user-facing G-code / critical protocol call
+ACE_PROTO_RETRIES = 3
+
+# Background reconnect when ACE is unplugged or USB is flaky
+ACE_RECONNECT_BACKOFF_MIN = 5.0
+ACE_RECONNECT_BACKOFF_MAX = 30.0
+ACE_RECONNECT_BACKOFF_FACTOR = 1.5
+ACE_RECONNECT_INITIAL_DELAY = 0.25
 
 try: from extras.AFC_utils import ERROR_STR
 except: raise error("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
@@ -83,6 +93,8 @@ class afcACE(afcUnit):
         # Status tracking
         self.last_status = None
         self.connected = False
+        self._ace_connect_timer = None
+        self._reconnect_backoff = ACE_RECONNECT_BACKOFF_MIN
 
         logging.info(f"AFC_ACE: Initialized unit '{self.name}'")
 
@@ -93,85 +105,177 @@ class afcACE(afcUnit):
         """
         super().handle_connect()
 
-        # Set up ASCII art logo for AFC
-        self.logo = '<span class=success--text> ___   _____  _____\n'
-        self.logo += 'A   | |     || |   \n'
-        self.logo += 'C---| | |---|| |---\n'
-        self.logo += 'E   | |_____||_____|\n'
-        self.logo += '  ' + self.name + '\n'
+        # Banner for PREP / status (Mainsail success--text)
+        _ace_banner = (
+            "   █████╗   ██████╗ ███████╗\n"
+            "  ██╔══██╗ ██╔════╝ ██╔════╝\n"
+            "  ███████║ ██║      █████╗  \n"
+            "  ██╔══██║ ██║      ██╔══╝  \n"
+            "  ██║  ██║ ╚██████╗ ███████╗\n"
+            "  ╚═╝  ╚═╝  ╚═════╝ ╚══════╝\n"
+        )
+        self.logo = (
+            '<span class=success--text>'
+            + _ace_banner
+            + ("  %s\n" % self.name.center(36))
+            + "</span>"
+        )
 
-        self.logo_error = '<span class=error--text>E  _ _   _ _\n'
-        self.logo_error += 'R |_|_|_|_|_|\n'
-        self.logo_error += 'R |   ACE    |\n'
-        self.logo_error += 'O |   ERROR  |\n'
-        self.logo_error += 'R |  <span class=secondary--text>X</span>       |\n'
-        self.logo_error += '! |_________|\n'
-        self.logo_error += '  ' + self.name + '\n'
+        self.logo_error = (
+            '<span class=error--text>'
+            '   █████╗   ██████╗ ███████╗\n'
+            '  ██╔══██╗ ██╔════╝ ██╔════╝\n'
+            '  ███████║ ██║ <span class=secondary--text>X</span>  █████╗  \n'
+            '  ██╔══██║ ██║      ██╔══╝  \n'
+            '  ██║  ██║ ╚██████╗ ███████╗\n'
+            '  ╚═╝  ╚═╝  ╚═════╝ ╚══════╝\n'
+            + ("  %s\n" % self.name.center(36))
+            + "</span>"
+        )
 
-        # Connect to ACE device
-        self._connect_ace()
-
-        # Register ACE-specific G-code commands (ACE_GET_STATUS, ACE_FEED, etc.)
+        # Register ACE-specific G-code commands first so they exist while USB connects
         self._register_gcode_commands()
+
+        # Deferred USB connect with retries
+        self._reconnect_backoff = ACE_RECONNECT_BACKOFF_MIN
+        self._ace_connect_timer = self.reactor.register_timer(
+            self._ace_connect_timer_handler,
+            self.reactor.monotonic() + ACE_RECONNECT_INITIAL_DELAY,
+        )
+        self.gcode.respond_info(
+            "AFC_ACE: unit '%s' will connect in background (USB may enumerate late)"
+            % self.name
+        )
 
         # Note: Lane mapping is built lazily in get_slot_for_lane()
         # because lanes aren't registered to the unit until after handle_connect()
 
-    def _connect_ace(self):
-        """Connect to ACE Pro device via USB"""
+    def _cleanup_failed_connect(self):
+        """Drop protocol state after a failed or partial connect."""
+        self.connected = False
+        self.device_info = None
+        if self.protocol:
+            try:
+                self.protocol.disconnect()
+            except Exception:
+                pass
+            self.protocol = None
+
+    def _connect_ace_sync(self):
+        """
+        Single connect attempt. Returns True if fully online.
+        Does not raise on I/O or missing device — returns False so timers can retry.
+        Raises configparser.Error only for unrecoverable misconfiguration.
+        """
+        if not self.auto_detect and not self.serial:
+            raise error(
+                "AFC_ACE: No serial port for unit '%s'. Set 'serial' or enable 'auto_detect'"
+                % self.name
+            )
+
+        if self.auto_detect:
+            logging.info("AFC_ACE: Auto-detecting ACE devices...")
+            devices = AceDiscovery.find_ace_devices()
+            if not devices:
+                logging.warning("AFC_ACE: No ACE devices found (auto_detect)")
+                return False
+            if self.device_index >= len(devices):
+                raise error(
+                    "AFC_ACE: Device index %s out of range (found %s devices)"
+                    % (self.device_index, len(devices))
+                )
+            device = devices[self.device_index]
+            self.serial = device["port"]
+            self.device_id = device["device_id"]
+            logging.info(
+                "AFC_ACE: Auto-detected device %s: %s (ID: %s)"
+                % (self.device_index, self.serial, self.device_id)
+            )
+
+        self._cleanup_failed_connect()
+
         try:
-            # Auto-detect or use configured serial port
-            if self.auto_detect:
-                logging.info(f"AFC_ACE: Auto-detecting ACE devices...")
-                devices = AceDiscovery.find_ace_devices()
-
-                if not devices:
-                    raise error(f"AFC_ACE: No ACE devices found during auto-detection")
-
-                if self.device_index >= len(devices):
-                    raise error(f"AFC_ACE: Device index {self.device_index} out of range (found {len(devices)} devices)")
-
-                device = devices[self.device_index]
-                self.serial = device['port']
-                self.device_id = device['device_id']
-
-                logging.info(f"AFC_ACE: Auto-detected device {self.device_index}: {self.serial} (ID: {self.device_id})")
-
-            # Validate serial port
-            if not self.serial:
-                raise error(f"AFC_ACE: No serial port configured for unit '{self.name}'. Set 'serial' or enable 'auto_detect'")
-
-            # Create protocol handler
             self.protocol = AceProtocol(self.serial, self.baud)
-
-            # Connect
             if not self.protocol.connect():
-                raise error(f"AFC_ACE: Failed to connect to {self.serial}")
+                logging.warning("AFC_ACE: Failed to open serial %s", self.serial)
+                self._cleanup_failed_connect()
+                return False
 
-            # Get device info
             self.device_info = self.protocol.get_info()
-
             if not self.device_info:
-                raise error(f"AFC_ACE: Failed to get device info from {self.serial}")
+                logging.warning("AFC_ACE: get_info failed for %s", self.serial)
+                self._cleanup_failed_connect()
+                return False
 
             self.connected = True
+            model = self.device_info.get("model", "Unknown")
+            firmware = self.device_info.get("firmware", "Unknown")
+            logging.info(
+                "AFC_ACE: ✓ Connected to %s (FW: %s) at %s"
+                % (model, firmware, self.serial)
+            )
 
-            model = self.device_info.get('model', 'Unknown')
-            firmware = self.device_info.get('firmware', 'Unknown')
-
-            logging.info(f"AFC_ACE: ✓ Connected to {model} (FW: {firmware}) at {self.serial}")
-
-            # Get initial status (with delay to allow device to be ready)
-            import time
             time.sleep(0.2)
             self.last_status = self.protocol.get_status()
-
             if not self.last_status:
-                logging.warning(f"AFC_ACE: Could not get initial status from {self.serial}, will retry later")
-
+                logging.warning(
+                    "AFC_ACE: Could not get initial status from %s, will retry later",
+                    self.serial,
+                )
+            return True
+        except error:
+            raise
         except Exception as e:
-            logging.error(f"AFC_ACE: Connection error: {e}")
-            raise error(f"AFC_ACE: Failed to connect to ACE device: {e}")
+            logging.warning("AFC_ACE: Connect attempt failed for '%s': %s", self.name, e)
+            self._cleanup_failed_connect()
+            return False
+
+    def _schedule_reconnect_timer(self, initial_delay):
+        """Arm background reconnect if nothing is scheduled yet."""
+        if self.connected or self._ace_connect_timer is not None:
+            return
+        wake = self.reactor.monotonic() + initial_delay
+        self._ace_connect_timer = self.reactor.register_timer(
+            self._ace_connect_timer_handler, wake
+        )
+
+    def _ace_connect_timer_handler(self, eventtime):
+        """Keep trying USB until connected, with exponential backoff."""
+        try:
+            if self.connected:
+                self._ace_connect_timer = None
+                return self.reactor.NEVER
+
+            if self._connect_ace_sync():
+                self._reconnect_backoff = ACE_RECONNECT_BACKOFF_MIN
+                model = self.device_info.get("model", "Unknown")
+                firmware = self.device_info.get("firmware", "Unknown")
+                self.gcode.respond_info(
+                    "AFC_ACE: unit '%s' connected — %s (FW: %s) at %s"
+                    % (self.name, model, firmware, self.serial)
+                )
+                self._ace_connect_timer = None
+                return self.reactor.NEVER
+
+            backoff = self._reconnect_backoff
+            nxt = self._reconnect_backoff * ACE_RECONNECT_BACKOFF_FACTOR
+            if nxt >= ACE_RECONNECT_BACKOFF_MAX:
+                self._reconnect_backoff = ACE_RECONNECT_BACKOFF_MIN
+            else:
+                self._reconnect_backoff = nxt
+
+            portmsg = self.serial or "(auto-detect: no device yet)"
+            self.gcode.respond_info(
+                "AFC_ACE: unit '%s' not reachable (%s); retry in %.0fs"
+                % (self.name, portmsg, backoff)
+            )
+            return eventtime + backoff
+        except error as e:
+            logging.exception("AFC_ACE: config error for unit '%s'", self.name)
+            self.gcode.respond_info("AFC_ACE: unit '%s' config error: %s" % (self.name, e))
+            self._ace_connect_timer = None
+            self._cleanup_failed_connect()
+            return self.reactor.NEVER
 
     def _ensure_connected(self):
         """
@@ -182,16 +286,54 @@ class afcACE(afcUnit):
         to re-discover and reconnect when auto_detect is enabled.
         """
         try:
-            if not self.protocol or not self.connected:
-                self._connect_ace()
+            if (
+                self.connected
+                and self.protocol
+                and getattr(self.protocol, "serial", None)
+                and self.protocol.serial.is_open
+            ):
                 return
-            if not getattr(self.protocol, "serial", None) or not self.protocol.serial.is_open:
-                # Trigger a fresh connect path (including auto-detect)
-                self.connected = False
-                self._connect_ace()
+            self.connected = False
+            if self._connect_ace_sync():
+                return
+            self._schedule_reconnect_timer(self._reconnect_backoff)
+            raise error(
+                "AFC_ACE: unit '%s' not connected (USB); background retry scheduled"
+                % self.name
+            )
+        except error:
+            raise
         except Exception as e:
-            # Leave a clean error for callers
             raise error(f"AFC_ACE: Unable to (re)connect unit '{self.name}': {e}")
+
+    def _proto_retry(self, label, fn):
+        """
+        Run a protocol callable until it returns a truthy value or attempts exhausted.
+        Reconnects between attempts to recover from transient USB I/O errors.
+        """
+        for attempt in range(ACE_PROTO_RETRIES):
+            try:
+                self._ensure_connected()
+                res = fn()
+                if res:
+                    return res
+            except Exception as e:
+                logging.warning(
+                    "AFC_ACE: %s (unit=%s) attempt %s/%s failed: %s",
+                    label, self.name, attempt + 1, ACE_PROTO_RETRIES, e,
+                )
+            if attempt + 1 < ACE_PROTO_RETRIES:
+                time.sleep(0.2 * (attempt + 1))
+        return None
+
+    def _respond_ok(self, cmd_name, detail=None):
+        """Uniform SUCCESS line for completed G-code commands."""
+        if detail:
+            self.afc.gcode.respond_info(
+                "%s: SUCCESS unit=%s — %s" % (cmd_name, self.name, detail)
+            )
+        else:
+            self.afc.gcode.respond_info("%s: SUCCESS unit=%s" % (cmd_name, self.name))
 
     def _cmd_guard(self, label: str, fn):
         """
@@ -264,7 +406,7 @@ class afcACE(afcUnit):
     def _cmd_ACE_GET_STATUS(self, gcmd):
         self._ensure_connected()
 
-        status = self.protocol.get_status()
+        status = self._proto_retry("get_status", self.protocol.get_status)
         info = self.device_info or {}
 
         if not status:
@@ -293,6 +435,7 @@ class afcACE(afcUnit):
             lines.append("  Slots: (unavailable)")
 
         self.afc.gcode.respond_info("\n".join(lines))
+        self._respond_ok("ACE_GET_STATUS")
 
     def _parse_index_speed_len(self, gcmd):
         index = gcmd.get_int("INDEX", None)
@@ -319,10 +462,16 @@ class afcACE(afcUnit):
     def _cmd_ACE_FEED(self, gcmd):
         self._ensure_connected()
         index, length, speed = self._parse_index_speed_len(gcmd)
-        ok = self.protocol.feed(index, length, speed)
+        ok = self._proto_retry(
+            "feed",
+            lambda: self.protocol.feed(index, length, speed),
+        )
         if not ok:
             raise error(f"AFC_ACE: ACE_FEED failed (unit={self.name} index={index})")
-        self.afc.gcode.respond_info(f"ACE_FEED: unit={self.name} index={index} length={int(length)} speed={speed}")
+        self._respond_ok(
+            "ACE_FEED",
+            "index=%s length=%s speed=%s" % (index, int(length), speed),
+        )
 
     def cmd_ACE_RETRACT(self, gcmd):
         return self._cmd_guard("ACE_RETRACT", lambda: self._cmd_ACE_RETRACT(gcmd))
@@ -330,10 +479,16 @@ class afcACE(afcUnit):
     def _cmd_ACE_RETRACT(self, gcmd):
         self._ensure_connected()
         index, length, speed = self._parse_index_speed_len(gcmd)
-        ok = self.protocol.retract(index, length, speed)
+        ok = self._proto_retry(
+            "retract",
+            lambda: self.protocol.retract(index, length, speed),
+        )
         if not ok:
             raise error(f"AFC_ACE: ACE_RETRACT failed (unit={self.name} index={index})")
-        self.afc.gcode.respond_info(f"ACE_RETRACT: unit={self.name} index={index} length={int(length)} speed={speed}")
+        self._respond_ok(
+            "ACE_RETRACT",
+            "index=%s length=%s speed=%s" % (index, int(length), speed),
+        )
 
     def cmd_ACE_START_DRYING(self, gcmd):
         return self._cmd_guard("ACE_START_DRYING", lambda: self._cmd_ACE_START_DRYING(gcmd))
@@ -342,18 +497,21 @@ class afcACE(afcUnit):
         self._ensure_connected()
         temp = gcmd.get_int("TEMP", 55)
         duration = gcmd.get_int("DURATION", 240)
-        ok = self.protocol.start_dryer(temp, duration)
+        ok = self._proto_retry(
+            "start_dryer",
+            lambda: self.protocol.start_dryer(temp, duration),
+        )
         if not ok:
             raise error(f"AFC_ACE: ACE_START_DRYING failed (unit={self.name})")
         # Immediately re-query status so users can verify it actually started.
-        import time
         time.sleep(0.2)
-        status = self.protocol.get_status() or {}
+        status = self._proto_retry("get_status", self.protocol.get_status) or {}
         dryer = status.get("dryer", status.get("dryer_status", None))
         cur_temp = status.get("temp", None)
-        self.afc.gcode.respond_info(
-            f"ACE_START_DRYING: unit={self.name} temp={temp} duration={duration}min"
-            f" (reported dryer={dryer} temp={cur_temp})"
+        self._respond_ok(
+            "ACE_START_DRYING",
+            "temp=%s duration=%smin (reported dryer=%s temp=%s)"
+            % (temp, duration, dryer, cur_temp),
         )
 
     def cmd_ACE_STOP_DRYING(self, gcmd):
@@ -361,10 +519,10 @@ class afcACE(afcUnit):
 
     def _cmd_ACE_STOP_DRYING(self, gcmd):
         self._ensure_connected()
-        ok = self.protocol.stop_dryer()
+        ok = self._proto_retry("stop_dryer", self.protocol.stop_dryer)
         if not ok:
             raise error(f"AFC_ACE: ACE_STOP_DRYING failed (unit={self.name})")
-        self.afc.gcode.respond_info(f"ACE_STOP_DRYING: unit={self.name}")
+        self._respond_ok("ACE_STOP_DRYING")
 
     def cmd_ACE_ENABLE_FEED_ASSIST(self, gcmd):
         return self._cmd_guard("ACE_ENABLE_FEED_ASSIST", lambda: self._cmd_ACE_ENABLE_FEED_ASSIST(gcmd))
@@ -378,10 +536,13 @@ class afcACE(afcUnit):
             raise error("AFC_ACE: Missing LANE (or INDEX) parameter")
         if lane < 0 or lane > 3:
             raise error("AFC_ACE: LANE must be 0-3 for an ACE unit")
-        ok = self.protocol.set_feed_assist(lane, True)
+        ok = self._proto_retry(
+            "set_feed_assist_enable",
+            lambda: self.protocol.set_feed_assist(lane, True),
+        )
         if not ok:
             raise error(f"AFC_ACE: ACE_ENABLE_FEED_ASSIST failed (unit={self.name} lane={lane})")
-        self.afc.gcode.respond_info(f"ACE_ENABLE_FEED_ASSIST: unit={self.name} lane={lane}")
+        self._respond_ok("ACE_ENABLE_FEED_ASSIST", "lane=%s" % lane)
 
     def cmd_ACE_DISABLE_FEED_ASSIST(self, gcmd):
         return self._cmd_guard("ACE_DISABLE_FEED_ASSIST", lambda: self._cmd_ACE_DISABLE_FEED_ASSIST(gcmd))
@@ -395,30 +556,33 @@ class afcACE(afcUnit):
             raise error("AFC_ACE: Missing LANE (or INDEX) parameter")
         if lane < 0 or lane > 3:
             raise error("AFC_ACE: LANE must be 0-3 for an ACE unit")
-        ok = self.protocol.set_feed_assist(lane, False)
+        ok = self._proto_retry(
+            "set_feed_assist_disable",
+            lambda: self.protocol.set_feed_assist(lane, False),
+        )
         if not ok:
             raise error(f"AFC_ACE: ACE_DISABLE_FEED_ASSIST failed (unit={self.name} lane={lane})")
-        self.afc.gcode.respond_info(f"ACE_DISABLE_FEED_ASSIST: unit={self.name} lane={lane}")
+        self._respond_ok("ACE_DISABLE_FEED_ASSIST", "lane=%s" % lane)
 
     def cmd_ACE_ENABLE_RFID(self, gcmd):
         return self._cmd_guard("ACE_ENABLE_RFID", lambda: self._cmd_ACE_ENABLE_RFID(gcmd))
 
     def _cmd_ACE_ENABLE_RFID(self, gcmd):
         self._ensure_connected()
-        ok = self.protocol.enable_rfid()
+        ok = self._proto_retry("enable_rfid", self.protocol.enable_rfid)
         if not ok:
             raise error(f"AFC_ACE: ACE_ENABLE_RFID failed (unit={self.name})")
-        self.afc.gcode.respond_info(f"ACE_ENABLE_RFID: unit={self.name}")
+        self._respond_ok("ACE_ENABLE_RFID")
 
     def cmd_ACE_DISABLE_RFID(self, gcmd):
         return self._cmd_guard("ACE_DISABLE_RFID", lambda: self._cmd_ACE_DISABLE_RFID(gcmd))
 
     def _cmd_ACE_DISABLE_RFID(self, gcmd):
         self._ensure_connected()
-        ok = self.protocol.disable_rfid()
+        ok = self._proto_retry("disable_rfid", self.protocol.disable_rfid)
         if not ok:
             raise error(f"AFC_ACE: ACE_DISABLE_RFID failed (unit={self.name})")
-        self.afc.gcode.respond_info(f"ACE_DISABLE_RFID: unit={self.name}")
+        self._respond_ok("ACE_DISABLE_RFID")
 
     def cmd_ACE_GET_FILAMENT_INFO(self, gcmd):
         return self._cmd_guard("ACE_GET_FILAMENT_INFO", lambda: self._cmd_ACE_GET_FILAMENT_INFO(gcmd))
@@ -433,13 +597,17 @@ class afcACE(afcUnit):
         if index < 0 or index > 3:
             raise error("AFC_ACE: INDEX must be 0-3 for an ACE unit")
 
-        info = self.protocol.get_filament_info(index)
+        info = self._proto_retry(
+            "get_filament_info",
+            lambda: self.protocol.get_filament_info(index),
+        )
         if not info:
             self.afc.gcode.respond_info(f"ACE_GET_FILAMENT_INFO: No response (unit={self.name} index={index})")
             return
         # Print as JSON so it can be copy/pasted easily.
         import json
         self.afc.gcode.respond_info(f"ACE_GET_FILAMENT_INFO: {json.dumps(info, sort_keys=True)}")
+        self._respond_ok("ACE_GET_FILAMENT_INFO", "index=%s" % index)
 
     def _build_lane_mapping(self):
         """Build mapping between AFC lanes and ACE slots"""

@@ -433,7 +433,7 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        # ACEPRO reference implementation uses method "drying" with params
+        # Firmware expects method "drying" with params
         # {temp: <c>, duration: <minutes>}
         result = self.send_command("drying", {
             "temp": temp,
@@ -448,6 +448,6 @@ class AceProtocol:
         Returns:
             True if successful
         """
-        # ACEPRO reference implementation uses method "drying_stop"
+        # Firmware expects method "drying_stop"
         result = self.send_command("drying_stop")
         return result is not None
